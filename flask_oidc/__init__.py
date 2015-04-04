@@ -1,21 +1,39 @@
-from functools import wraps
-import os
-import json
-from base64 import b64encode
-import time as time_module
-from copy import copy
-import logging
+# -* coding: utf-8 -*-
+"""
+    flask.ext.oidc
+    ~~~~~~~~~~~~~~
+    OpenID Connect support for Flask.
 
-from six.moves.urllib.parse import urlencode
-from flask import request, session, redirect, url_for, g
-from oauth2client.client import flow_from_clientsecrets, OAuth2WebServerFlow,\
-    AccessTokenRefreshError
+    :copyright: (c) 2014 by Jeremy Ehrhardt <jeremy@bat-country.us>
+    :license: BSD, see LICENSE for more details.
+"""
+
 import httplib2
+import json
+import logging
+import os
+import sys
+import time as time_module
+
+from base64 import b64encode
+from copy import copy
+from flask import request, session, redirect, url_for, g
+from functools import wraps
 from itsdangerous import TimedJSONWebSignatureSerializer, SignatureExpired
+from oauth2client.client import (flow_from_clientsecrets, OAuth2WebServerFlow,
+                                 AccessTokenRefreshError)
+from six.moves.urllib.parse import urlencode
+from werkzeug import url_quote
 
 __all__ = ['OpenIDConnect', 'MemoryCredentials']
-
 logger = logging.getLogger(__name__)
+
+
+def isstring(x):
+    if sys.version_info[0] >= 3:
+        return isinstance(x, str)
+    else:
+        return isinstance(x, basestring)
 
 
 class MemoryCredentials(dict):
@@ -29,11 +47,18 @@ class MemoryCredentials(dict):
 
 class OpenIDConnect(object):
     """
-    @see: https://developers.google.com/api-client-library/python/start/get_started
-    @see: https://developers.google.com/api-client-library/python/samples/authorized_api_web_server_calendar.py
+    :see: https://developers.google.com/api-client-library/python/start/get_started
+    :see: https://developers.google.com/api-client-library/python/samples/authorized_api_web_server_calendar.py
+    :param fallback_endpoint: optionally a string with the name of an URL
+                              endpoint the user should be redirected to
+                              if the HTTP referrer is unreliable. By
+                              default the user is redirected back to the
+                              application's index in that case.
+    :param safe_roots: a list of trust roots to support returning to
     """
+
     def __init__(self, app=None, credentials_store=None, http=None, time=None,
-                 urandom=None):
+                 urandom=None, fallback_endpoint=None, safe_roots=None):
         # set from app config in .init_app()
         self.callback_path = None
         self.flow = None
@@ -48,11 +73,19 @@ class OpenIDConnect(object):
 
         # stuff that we might want to override for tests
         self.http = http if http is not None else httplib2.Http()
-        self.credentials_store = credentials_store\
-            if credentials_store is not None\
+        self.credentials_store = (
+            credentials_store if credentials_store is not None
             else MemoryCredentials()
+        )
         self.time = time if time is not None else time_module.time
         self.urandom = urandom if urandom is not None else os.urandom
+        self.after_login_func = lambda _, dest: redirect(dest)
+
+        self.fallback_endpoint = fallback_endpoint
+        if isstring(safe_roots):
+            self.safe_roots = [safe_roots]
+        else:
+            self.safe_roots = safe_roots
 
         # get stuff from the app's config, which may override stuff set above
         if app is not None:
@@ -62,9 +95,8 @@ class OpenIDConnect(object):
         """
         Do setup that requires a Flask app.
         """
-        # register callback route and cookie-setting decorator
-        app.route('/oidc_callback')(self.oidc_callback)
-        app.after_request(self.after_request)
+        # register cookie-setting decorator
+        app.after_request(self._after_request)
 
         # load client_secrets.json
         self.flow = flow_from_clientsecrets(
@@ -76,31 +108,20 @@ class OpenIDConnect(object):
         self.cookie_serializer = TimedJSONWebSignatureSerializer(
             app.config['SECRET_KEY'])
 
-        try:
-            self.google_apps_domain = app.config['OIDC_GOOGLE_APPS_DOMAIN']
-        except KeyError:
-            pass
+        self.google_apps_domain = app.config.get(
+            'OIDC_GOOGLE_APPS_DOMAIN', self.google_apps_domain)
 
-        try:
-            self.id_token_cookie_name = app.config['OIDC_ID_TOKEN_COOKIE_NAME']
-        except KeyError:
-            pass
+        self.id_token_cookie_name = app.config.get(
+            'OIDC_ID_TOKEN_COOKIE_NAME', self.id_token_cookie_name)
 
-        try:
-            self.id_token_cookie_ttl = app.config['OIDC_ID_TOKEN_COOKIE_TTL']
-        except KeyError:
-            pass
+        self.id_token_cookie_ttl = app.config.get(
+            'OIDC_ID_TOKEN_COOKIE_TTL', self.id_token_cookie_ttl)
 
-        try:
-            self.id_token_cookie_secure =\
-                app.config['OIDC_ID_TOKEN_COOKIE_SECURE']
-        except KeyError:
-            pass
+        self.id_token_cookie_secure = app.config.get(
+            'OIDC_ID_TOKEN_COOKIE_SECURE', self.id_token_cookie_secure)
 
-        try:
-            self.credentials_store = app.config['OIDC_CREDENTIALS_STORE']
-        except KeyError:
-            pass
+        self.credentials_store = app.config.get(
+            'OIDC_CREDENTIALS_STORE', self.credentials_store)
 
     def get_cookie_id_token(self):
         try:
@@ -110,16 +131,20 @@ class OpenIDConnect(object):
             logger.debug("Missing or invalid ID token cookie", exc_info=True)
             return None
 
-    def set_cookie_id_token(self, id_token):
+    def _set_cookie_id_token(self, id_token):
         """
         Cooperates with @after_request to set a new ID token cookie.
+
+        :internal:
         """
         g.oidc_id_token = id_token
         g.oidc_id_token_dirty = True
 
-    def after_request(self, response):
+    def _after_request(self, response):
         """
         Set a new ID token cookie if the ID token has changed.
+
+        :internal:
         """
         if getattr(g, 'oidc_id_token_dirty', False):
             signed_id_token = self.cookie_serializer.dumps(g.oidc_id_token)
@@ -138,9 +163,6 @@ class OpenIDConnect(object):
         to authenticate.
         :return: A redirect, or None if the user is authenticated.
         """
-        # the auth callback and error pages don't need user to be authenticated
-        if request.endpoint in frozenset(['oidc_callback', 'oidc_error']):
-            return None
 
         # retrieve signed ID token cookie
         id_token = self.get_cookie_id_token()
@@ -163,7 +185,7 @@ class OpenIDConnect(object):
                 credentials.refresh(self.http)
                 id_token = credentials.id_token
                 self.credentials_store[id_token['sub']] = credentials
-                self.set_cookie_id_token(id_token)
+                self._set_cookie_id_token(id_token)
             except AccessTokenRefreshError:
                 # Can't refresh. Wipe credentials and redirect user to IdP
                 # for re-authentication.
@@ -190,13 +212,141 @@ class OpenIDConnect(object):
             return view_func(*args, **kwargs)
         return decorated
 
+    def get_next_url(self):
+        """
+        Returns the URL where we want to redirect to. This will
+        always return a valid URL.
+        """
+        return (
+            self.check_safe_root(request.values.get('next')) or
+            self.check_safe_root(request.referrer) or
+            (self.fallback_endpoint and
+                self.check_safe_root(url_for(self.fallback_endpoint))) or
+            request.url_root
+        )
+
+    def check_safe_root(self, url):
+        if url is None:
+            return None
+        if self.safe_roots is None:
+            return url
+        if url.startswith(request.url_root) or url.startswith('/'):
+            # A URL inside the same app is deemed to always be safe
+            return url
+        for safe_root in self.safe_roots:
+            if url.startswith(safe_root):
+                return url
+        return None
+
+    def get_current_url(self):
+        """the current URL + next."""
+        return request.base_url + '?next=' + url_quote(self.get_next_url())
+
+    def loginhandler(self, f):
+        """
+        Marks a function as login handler. This decorator injects some
+        more OpenID Connect required logic. Always decorate your login
+        function with this decorator.
+        """
+
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            try:
+                session_csrf_token = session.pop('oidc_csrf_token')
+                state = json.loads(request.args['state'])
+                csrf_token = state['csrf_token']
+                destination = state['destination']
+                code = request.args['code']
+            except (KeyError, ValueError):
+                return f(*args, **kwargs)
+
+            # check callback CSRF token passed to IdP
+            # against session CSRF token held by user
+            if not constant_time_compare(csrf_token, session_csrf_token):
+                self.signal_error("CSRF token mismatch")
+                return redirect(self.get_current_url())
+
+            # make a request to IdP to exchange the auth code for OAuth
+            # credentials
+            flow = self.flow_for_request()
+            credentials = flow.step2_exchange(code, http=self.http)
+            id_token = credentials.id_token
+            if not self.is_id_token_valid(id_token):
+                logger.debug("Invalid ID token")
+                if id_token.get('hd') != self.google_apps_domain:
+                    self.signal_error(
+                        "You must log in with an account from the {0} domain."
+                        .format(self.google_apps_domain))
+                return redirect(self.get_current_url())
+
+            # store credentials by subject
+            # when Google is the IdP, the subject is their G+ account number
+            self.credentials_store[id_token['sub']] = credentials
+
+            # set a persistent signed cookie containing the ID token
+            # and call the after login handler
+            self._set_cookie_id_token(id_token)
+            return self.after_login_func(credentials, destination)
+        return decorated
+
+    def after_login(self, f):
+        """
+        This function will be called after login. It must redirect to
+        a different place and remember the user somewhere.
+
+        The function recevies the login credentials as first and the redirect
+        destination as second parameter.
+
+        Example::
+
+            @oidc.after_login
+            def login_handler(creds, destination):
+                session['oidc_creds'] = creds
+                return redirect(destination)
+        """
+
+        self.after_login_func = f
+        return f
+
+    def errorhandler(self, f):
+        """
+        Called if an error occurs with the message. By default
+        ``'oidc_error'`` is added to the session so that :meth:`fetch_error`
+        can fetch that error from the session.  Alternatively it makes sense
+        to directly flash the error for example::
+
+            @oidc.errorhandler
+            def on_error(message):
+                flash(u'Error: ' + message)
+        """
+
+        self.signal_error = f
+        return f
+
+    def fetch_error(self):
+        """
+        Fetches the error from the session. This removes it from the
+        session and returns that error. This method is probably useless
+        if :meth:`errorhandler` is used.
+        """
+        return session.pop('openid_error', None)
+
+    def signal_error(self, msg):
+        """
+        Signals an error. It does this by storing the message in the
+        session. Use :meth:`errorhandler` to this method.
+        """
+
+        session['oidc_error'] = msg
+
     def flow_for_request(self):
         """
         Build a flow with the correct absolute callback URL for this request.
         :return:
+        :internal:
         """
         flow = copy(self.flow)
-        flow.redirect_uri = url_for('oidc_callback', _external=True)
+        flow.redirect_uri = request.base_url
         return flow
 
     def redirect_to_auth_server(self, destination):
@@ -220,7 +370,7 @@ class OpenIDConnect(object):
             url=flow.step1_get_authorize_url(),
             extra_params=urlencode(extra_params))
         # if the user has an ID token, it's invalid, or we wouldn't be here
-        self.set_cookie_id_token(None)
+        self._set_cookie_id_token(None)
         return redirect(auth_url)
 
     def is_id_token_valid(self, id_token):
@@ -268,58 +418,20 @@ class OpenIDConnect(object):
 
         return True
 
-    WRONG_GOOGLE_APPS_DOMAIN = 'WRONG_GOOGLE_APPS_DOMAIN'
 
-    def oidc_callback(self):
-        """
-        Exchange the auth code for actual credentials,
-        then redirect to the originally requested page.
-        """
-        # retrieve session and callback variables
-        try:
-            session_csrf_token = session.pop('oidc_csrf_token')
+def constant_time_compare(val1, val2):
+    """
+    Returns True if the two strings are equal, False otherwise.
 
-            state = json.loads(request.args['state'])
-            csrf_token = state['csrf_token']
-            destination = state['destination']
+    The time taken is independent of the number of characters that match.
 
-            code = request.args['code']
-        except (KeyError, ValueError):
-            logger.debug("Can't retrieve CSRF token, state, or code",
-                         exc_info=True)
-            return self.oidc_error()
-
-        # check callback CSRF token passed to IdP
-        # against session CSRF token held by user
-        if csrf_token != session_csrf_token:
-            logger.debug("CSRF token mismatch")
-            return self.oidc_error()
-
-        # make a request to IdP to exchange the auth code for OAuth credentials
-        flow = self.flow_for_request()
-        credentials = flow.step2_exchange(code, http=self.http)
-        id_token = credentials.id_token
-        if not self.is_id_token_valid(id_token):
-            logger.debug("Invalid ID token")
-            if id_token.get('hd') != self.google_apps_domain:
-                return self.oidc_error(
-                    "You must log in with an account from the {0} domain."
-                    .format(self.google_apps_domain),
-                    self.WRONG_GOOGLE_APPS_DOMAIN)
-            return self.oidc_error()
-
-        # store credentials by subject
-        # when Google is the IdP, the subject is their G+ account number
-        self.credentials_store[id_token['sub']] = credentials
-
-        # set a persistent signed cookie containing the ID token
-        # and redirect to the final destination
-        # TODO: validate redirect destination
-        response = redirect(destination)
-        self.set_cookie_id_token(id_token)
-        return response
-
-    def oidc_error(self, message='Not Authorized', code=None):
-        return (message, 401, {
-            'Content-Type': 'text/plain',
-        })
+    For the sake of simplicity, this function executes in constant time only
+    when the two strings have the same length. It short-circuits when they
+    have different lengths.
+    """
+    if len(val1) != len(val2):
+        return False
+    result = 0
+    for x, y in zip(val1, val2):
+        result |= ord(x) ^ ord(y)
+    return result == 0

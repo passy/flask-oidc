@@ -4,9 +4,11 @@ import codecs
 from base64 import urlsafe_b64encode
 
 from six.moves.urllib.parse import urlsplit, parse_qs, urlencode
-from nose.tools import nottest
+from nose.tools import nottest, eq_
 
 from .app import create_app
+from flask import g
+from flask.ext.oidc import OpenIDConnect
 
 
 with resource_stream(__name__, 'client_secrets.json') as f:
@@ -45,8 +47,10 @@ class MockHttp(object):
         return MockHttpResponse(), json.dumps({
             'access_token': 'mock_access_token',
             'refresh_token': 'mock_refresh_token',
+            'invalid': False,
             'id_token': '.{0}.'.format(urlsafe_b64encode(json.dumps({
                 'aud': client_secrets['web']['client_id'],
+                'iss': 'accounts.google.com',
                 'sub': 'mock_user_id',
                 'email_verified': True,
                 'iat': self.iat,
@@ -75,7 +79,7 @@ def make_test_client():
     })
     test_client = app.test_client()
 
-    return test_client, http, clock
+    return app, test_client, http, clock
 
 
 def callback_url_for(response):
@@ -86,7 +90,7 @@ def callback_url_for(response):
     location = urlsplit(response.headers['Location'])
     query = parse_qs(location.query)
     state = query['state'][0]
-    callback_url = '/oidc_callback?'\
+    callback_url = '/login?'\
                    + urlencode({'state': state, 'code': 'mock_auth_code'})
     return callback_url
 
@@ -95,32 +99,37 @@ def test_signin():
     """
     Happy path authentication test.
     """
-    test_client, _, _ = make_test_client()
+    _, test_client, _, _ = make_test_client()
 
-    # make an unauthenticated request,
-    # which should result in a redirect to the IdP
-    r1 = test_client.get('/')
-    assert r1.status_code == 302,\
-        "Expected redirect to IdP "\
-        "(response status was {response.status})".format(response=r1)
+    with test_client as c:
+        # make an unauthenticated request,
+        # which should result in a redirect to the IdP
+        r1 = c.get('/')
+        assert r1.status_code == 302,\
+            "Expected redirect to IdP "\
+            "(response status was {response.status})".format(response=r1)
 
-    # the app should now contact the IdP
-    # to exchange that auth code for credentials
-    r2 = test_client.get(callback_url_for(r1))
-    assert r2.status_code == 302,\
-        "Expected redirect to destination "\
-        "(response status was {response.status})".format(response=r2)
-    r2location = urlsplit(r2.headers['Location'])
-    assert r2location.path == '/',\
-        "Expected redirect to destination "\
-        "(unexpected path {location.path})".format(location=r2location)
+        g.user = None
+
+        # the app should now contact the IdP
+        # to exchange that auth code for credentials
+        r2 = c.get(callback_url_for(r1))
+        assert r2.status_code == 302,\
+            "Expected redirect to destination "\
+            "(response status was {response.status})".format(response=r2)
+        r2location = urlsplit(r2.headers['Location'])
+        assert r2location.path == '/',\
+            "Expected redirect to destination "\
+            "(unexpected path {location.path})".format(location=r2location)
+
+        eq_(g.user, 'mock_user_id')
 
 
 def test_refresh():
     """
     Test token expiration and refresh.
     """
-    test_client, http, clock = make_test_client()
+    _, test_client, http, clock = make_test_client()
 
     # authenticate and get an ID token cookie
     auth_redirect = test_client.get('/')
@@ -137,3 +146,19 @@ def test_refresh():
     body = parse_qs(http.last_request['body'])
     assert body.get('refresh_token') == ['mock_refresh_token'],\
         "App should have tried to refresh credentials"
+
+
+def test_safe_roots():
+    oidc = OpenIDConnect(
+        safe_roots=['https://example.com', 'https://foo.bar'])
+
+    root = 'https://example.com/'
+    app, _, _, _ = make_test_client()
+
+    with app.test_request_context('/login'):
+        eq_(oidc.check_safe_root(root + 'login'), root + 'login')
+        eq_(oidc.check_safe_root(None), None)
+        eq_(oidc.check_safe_root('https://evil.com/1337'), None)
+        eq_(oidc.check_safe_root(root + 'login'), root + 'login')
+        eq_(oidc.check_safe_root(None), None)
+        eq_(oidc.check_safe_root('/login'), '/login')
