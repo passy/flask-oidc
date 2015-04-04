@@ -1,6 +1,12 @@
 flask-oidc
 ==========
 
+This is a custom fork to bring this a bit closer to the
+`Flask-OpenID <https://github.com/mitsuhiko/flask-openid>`_ extension. I intend
+to bring some of the changes back to the original, but I'm a bit under time
+pressure to convert an existing OpenID app to OpenID Connect before Google shuts
+down their endpoint, so please bear with me. <3
+
 `OpenID Connect <https://openid.net/connect/>`_ support for `Flask <http://flask.pocoo.org/>`_.
 
 .. image:: https://img.shields.io/pypi/v/flask-oidc.svg?style=flat
