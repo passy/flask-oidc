@@ -15,8 +15,8 @@ down their endpoint, so please bear with me. <3
 .. image:: https://img.shields.io/pypi/dm/flask-oidc.svg?style=flat
   :target: https://pypi.python.org/pypi/flask-oidc
 
-.. image:: https://img.shields.io/travis/SteelPangolin/flask-oidc.svg?style=flat
-  :target: https://travis-ci.org/SteelPangolin/flask-oidc
+.. image:: https://img.shields.io/travis/passy/flask-oidc.svg?style=flat
+  :target: https://travis-ci.org/passy/flask-oidc
 
 Currently designed around Google's `oauth2client <https://github.com/google/oauth2client>`_ library
 and `OpenID Connect implementation <https://developers.google.com/accounts/docs/OAuth2Login>`_.
