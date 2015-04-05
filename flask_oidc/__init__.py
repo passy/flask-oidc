@@ -101,7 +101,7 @@ class OpenIDConnect(object):
         # load client_secrets.json
         self.flow = flow_from_clientsecrets(
             app.config['OIDC_CLIENT_SECRETS'],
-            scope=['openid', 'email'])
+            scope=app.config.get('OIDC_SCOPES', ['openid', 'email']))
         assert isinstance(self.flow, OAuth2WebServerFlow)
 
         # create a cookie signer using the Flask secret key
